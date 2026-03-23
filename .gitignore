@@ -1,0 +1,25 @@
+
+.claude/
+.DS_Store
+.env
+.env.local
+.idea/
+.serena/
+.vscode/
+*.iml
+*.log
+*.swo
+*.swp
+**/*.rs.bk
+/target/
+# Environment
+# IDE
+# Log files
+# macOS
+# Runtime config (contains credentials, use config.example.toml as template)
+# Rust
+# TLS certificates (generated at runtime)
+Cargo.lock
+config.toml
+docs/superpowers/
+tls/

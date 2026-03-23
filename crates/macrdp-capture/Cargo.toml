@@ -1,0 +1,12 @@
+[package]
+name = "macrdp-capture"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+screencapturekit = { version = "1.5", features = ["macos_14_0"] }
+core-graphics = "0.25"

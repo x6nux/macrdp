@@ -1,0 +1,24 @@
+[package]
+name = "macrdp-server"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+macrdp-capture = { path = "../macrdp-capture" }
+macrdp-input = { path = "../macrdp-input" }
+macrdp-encode = { path = "../macrdp-encode" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+ironrdp-server = { version = "0.10", features = ["helper"] }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+rcgen = "0.13"
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"
