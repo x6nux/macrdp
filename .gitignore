@@ -5,13 +5,17 @@
 .env.local
 .idea/
 .serena/
+.spec-workflow/
+.superpowers/
 .vscode/
 *.iml
 *.log
 *.swo
 *.swp
 **/*.rs.bk
+# Rust build artifacts
 /target/
+**/target/
 # Environment
 # IDE
 # Log files
@@ -23,3 +27,9 @@ Cargo.lock
 config.toml
 docs/superpowers/
 tls/
+# Node / Frontend build artifacts
+node_modules/
+macrdp-ui/dist/
+# Misc
+*.git.bak/
+**/.git.bak/

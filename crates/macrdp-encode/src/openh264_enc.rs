@@ -5,6 +5,7 @@ use bytes::Bytes;
 use openh264::encoder::{Encoder, EncoderConfig, FrameType};
 use openh264::formats::YUVBuffer;
 
+use crate::color_convert::VImageConverter;
 use crate::{Avc444EncodedFrame, EncodedFrame, Quality, VideoEncoder};
 
 pub struct OpenH264Encoder {
@@ -18,6 +19,8 @@ pub struct OpenH264Encoder {
     /// Current target bitrate
     target_bitrate: u32,
     mode_444: bool,
+    /// vImage SIMD accelerated BGRA→I420 converter (macOS Accelerate.framework)
+    vimage: Option<VImageConverter>,
     /// Reusable buffers for AVC444 YUV444 split
     yuv444_bufs: Option<Yuv444SplitBufs>,
 }
@@ -71,11 +74,12 @@ fn create_oh264_encoder(_width: u32, _height: u32, fps: f32, bitrate: u32) -> Re
         .rate_control_mode(openh264::encoder::RateControlMode::Quality)
         .background_detection(false)
         .adaptive_quantization(true)
-        .qp(openh264::encoder::QpRange::new(18, 36))
+        .qp(openh264::encoder::QpRange::new(20, 40))
         .skip_frames(false)
         .usage_type(openh264::encoder::UsageType::ScreenContentRealTime)
-        .complexity(openh264::encoder::Complexity::High)
-        .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps as u32 * 2))
+        .complexity(openh264::encoder::Complexity::Medium)
+        .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps as u32 * 5))
+        .long_term_reference(true)
         .num_threads(4);
 
     Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
@@ -96,6 +100,10 @@ impl OpenH264Encoder {
         } else {
             None
         };
+
+        let vimage = VImageConverter::new()
+            .map_err(|e| tracing::warn!("vImage init failed, using scalar fallback: {e}"))
+            .ok();
 
         let yuv_size = (width * height * 3 / 2) as usize;
 
@@ -120,6 +128,7 @@ impl OpenH264Encoder {
             yuv_buf: vec![0u8; yuv_size],
             target_bitrate: bitrate,
             mode_444,
+            vimage,
             yuv444_bufs,
         })
     }
@@ -188,7 +197,21 @@ impl VideoEncoder for OpenH264Encoder {
         self.yuv_buf[y_size + uv_size..].fill(128);
 
         // Convert visible BGRA area to YUV420
-        bgra_to_yuv420_padded(data, width, height, stride, self.width, self.height, &mut self.yuv_buf);
+        if let Some(ref converter) = self.vimage {
+            // vImage handles width*height directly; we need to handle encoder padding separately
+            // For now, use vImage for the visible area, then zero-fill padding
+            if width == self.width && height == self.height {
+                // No padding needed — vImage directly
+                converter.bgra_to_i420(data, width, height, stride, &mut self.yuv_buf)
+                    .map_err(|e| anyhow::anyhow!("vImage BGRA->I420 failed: {e}"))?;
+            } else {
+                // Encoder dimensions have padding — use scalar fallback for now
+                // TODO: vImage with manual padding
+                bgra_to_yuv420_padded(data, width, height, stride, self.width, self.height, &mut self.yuv_buf);
+            }
+        } else {
+            bgra_to_yuv420_padded(data, width, height, stride, self.width, self.height, &mut self.yuv_buf);
+        }
 
         let yuv = YUVBuffer::from_vec(
             self.yuv_buf.clone(),
@@ -196,10 +219,14 @@ impl VideoEncoder for OpenH264Encoder {
             self.height as usize,
         );
 
+        // Force IDR on next frame if requested
+        if self.force_keyframe {
+            self.encoder.force_intra_frame();
+            self.force_keyframe = false;
+        }
+
         let bitstream = self.encoder.encode(&yuv)
             .context("OpenH264 encode failed")?;
-
-        self.force_keyframe = false;
 
         let mut nal_data = Vec::new();
         bitstream.write_vec(&mut nal_data);

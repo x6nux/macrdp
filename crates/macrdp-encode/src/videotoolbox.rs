@@ -8,6 +8,7 @@ use bytes::Bytes;
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use crate::color_convert::VImageConverter;
 use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder};
 
 // --- FFI declarations ---
@@ -165,8 +166,10 @@ extern "C" {
         num_values: isize, callbacks: *const c_void,
     ) -> CFTypeRef;
     fn CFRelease(cf: *const c_void);
+    fn CFStringCreateWithCString(alloc: CFAllocatorRef, c_str: *const i8, encoding: u32) -> CFStringRef;
 
     static kCFTypeArrayCallBacks: c_void;
+    static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
     static kVTCompressionPropertyKey_DataRateLimits: CFStringRef;
     static kVTCompressionPropertyKey_ColorPrimaries: CFStringRef;
     static kVTCompressionPropertyKey_TransferFunction: CFStringRef;
@@ -372,6 +375,12 @@ pub struct VtEncoder {
     fps: f32,
     mode_444: bool,
     yuv444_buf: Option<Yuv444Buffers>,
+    pending_force_keyframe: bool,
+    /// vImage SIMD converter for CG fallback path (BGRA→NV12).
+    /// Will be used when the CG fallback path is refactored to avoid
+    /// the hand-written conversion loop.
+    #[allow(dead_code)]
+    vimage: Option<VImageConverter>,
 }
 
 // VTCompressionSession is thread-safe per Apple docs
@@ -400,6 +409,10 @@ impl VtEncoder {
             None
         };
 
+        let vimage = VImageConverter::new()
+            .map_err(|e| tracing::warn!("vImage init failed: {e}"))
+            .ok();
+
         tracing::info!(
             width, height, fps, mode_444,
             bitrate_mbps = bitrate as f64 / 1_000_000.0,
@@ -417,6 +430,8 @@ impl VtEncoder {
             fps,
             mode_444,
             yuv444_buf,
+            pending_force_keyframe: false,
+            vimage,
         })
     }
 
@@ -507,8 +522,22 @@ impl VtEncoder {
             VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, cf_f64(fps as f64));
             VTSessionSetProperty(session, kVTCompressionPropertyKey_AverageBitRate, cf_i32(bitrate as i32));
             tracing::info!(bitrate_mbps = bitrate as f64 / 1_000_000.0, fps, "VT session bitrate set");
-            // IDR every 2 seconds for error recovery
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(fps as i32 * 2));
+            // IDR every 5 seconds — less frequent keyframes reduce bandwidth spikes
+            VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(fps as i32 * 5));
+
+            // PrioritizeEncodingSpeedOverQuality (macOS 14+) — reduce encode latency
+            {
+                let key_bytes = b"PrioritizeEncodingSpeedOverQuality\0";
+                let key = CFStringCreateWithCString(
+                    std::ptr::null(),
+                    key_bytes.as_ptr() as *const i8,
+                    0x08000100, // kCFStringEncodingUTF8
+                );
+                if !key.is_null() {
+                    VTSessionSetProperty(session, key, kCFBooleanTrue);
+                    CFRelease(key);
+                }
+            }
 
             VTCompressionSessionPrepareToEncodeFrames(session);
         }
@@ -665,6 +694,7 @@ impl VtEncoder {
 
     /// Convert BGRA frame to NV12 full-range via session pool buffer (single pass).
     /// BT.601 full range: Y=0-255, UV=0-255.
+    #[allow(dead_code)]
     fn create_nv12_from_bgra(
         session: VTCompressionSessionRef,
         enc_w: u32, enc_h: u32,
@@ -895,7 +925,8 @@ impl VtEncoder {
         Ok(pb)
     }
 
-    /// Encode a single frame through a VT session and wait for the callback
+    /// Encode a single frame through a VT session and wait for the callback.
+    /// `frame_properties` is passed to VTCompressionSessionEncodeFrame (e.g. to force keyframe).
     fn encode_session_frame(
         session: VTCompressionSessionRef,
         ctx: &Arc<CallbackCtx>,
@@ -903,6 +934,7 @@ impl VtEncoder {
         pts: CMTime,
         duration: CMTime,
         frame_count: u64,
+        frame_properties: CFDictionaryRef,
     ) -> Result<(Vec<u8>, bool)> {
         // Reset callback state
         {
@@ -915,20 +947,20 @@ impl VtEncoder {
         unsafe {
             let enc_status = VTCompressionSessionEncodeFrame(
                 session, pixel_buffer, pts, duration,
-                std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut(),
+                frame_properties, std::ptr::null_mut(), std::ptr::null_mut(),
             );
             if enc_status != 0 {
                 anyhow::bail!("VTCompressionSessionEncodeFrame failed: {enc_status}");
             }
         }
 
-        // Wait for callback
+        // Wait for callback (32ms — tight timeout for low-latency encoding)
         let timed_out;
         {
             let guard = ctx.output.lock().unwrap();
             let (guard2, wait_result) = ctx.ready.wait_timeout_while(
                 guard,
-                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(32),
                 |_| !ctx.has_data.load(std::sync::atomic::Ordering::Acquire),
             ).unwrap();
             timed_out = wait_result.timed_out();
@@ -969,9 +1001,29 @@ impl VideoEncoder for VtEncoder {
             self.session, self.width, self.height, data, width, height, stride,
         )?;
 
+        // Build frame properties dict to force IDR when requested
+        let frame_props = if self.pending_force_keyframe {
+            self.pending_force_keyframe = false;
+            unsafe {
+                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
+                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
+                CFDictionaryCreate(
+                    std::ptr::null(), keys.as_ptr(), values.as_ptr(),
+                    1, std::ptr::null(), std::ptr::null(),
+                )
+            }
+        } else {
+            std::ptr::null()
+        };
+
         let (nal_data, is_keyframe) = Self::encode_session_frame(
             self.session, &self.callback_ctx, pixel_buffer, pts, duration, self.frame_count,
+            frame_props,
         )?;
+
+        if !frame_props.is_null() {
+            unsafe { CFRelease(frame_props); }
+        }
         unsafe { CVPixelBufferRelease(pixel_buffer); }
 
         self.frame_count += 1;
@@ -1042,6 +1094,50 @@ impl VideoEncoder for VtEncoder {
         })
     }
 
+    fn encode_pixel_buffer(&mut self, pixel_buffer_ptr: *mut c_void, force_keyframe: bool) -> Result<EncodedFrame> {
+        if force_keyframe {
+            self.pending_force_keyframe = true;
+        }
+
+        let frame_duration = (600.0 / self.fps as f64) as i64;
+        let pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
+        let duration = CMTime::make(frame_duration, 600);
+
+        // Build frame properties for force keyframe if needed
+        let frame_props = if self.pending_force_keyframe {
+            self.pending_force_keyframe = false;
+            unsafe {
+                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
+                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
+                CFDictionaryCreate(
+                    std::ptr::null(), keys.as_ptr(), values.as_ptr(),
+                    1, std::ptr::null(), std::ptr::null(),
+                )
+            }
+        } else {
+            std::ptr::null()
+        };
+
+        // Zero-copy: pass the CVPixelBuffer directly to VT — no color conversion
+        let (nal_data, is_keyframe) = Self::encode_session_frame(
+            self.session, &self.callback_ctx, pixel_buffer_ptr, pts, duration, self.frame_count,
+            frame_props,
+        )?;
+
+        if !frame_props.is_null() {
+            unsafe { CFRelease(frame_props); }
+        }
+
+        self.frame_count += 1;
+
+        Ok(EncodedFrame {
+            data: Bytes::from(nal_data),
+            is_keyframe,
+            width: self.width,
+            height: self.height,
+        })
+    }
+
     fn encode_bgra_444(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<Avc444EncodedFrame> {
         let bufs = self.yuv444_buf.as_mut()
             .ok_or_else(|| anyhow::anyhow!("AVC444 not enabled: no YUV444 buffers"))?;
@@ -1065,6 +1161,21 @@ impl VideoEncoder for VtEncoder {
         let frame_duration = (600.0 / self.fps as f64) as i64;
         let duration = CMTime::make(frame_duration, 600);
 
+        // Build frame properties dict to force IDR on both streams when requested
+        let frame_props = if self.pending_force_keyframe {
+            self.pending_force_keyframe = false;
+            unsafe {
+                let keys: [CFTypeRef; 1] = [kVTEncodeFrameOptionKey_ForceKeyFrame];
+                let values: [CFTypeRef; 1] = [kCFBooleanTrue];
+                CFDictionaryCreate(
+                    std::ptr::null(), keys.as_ptr(), values.as_ptr(),
+                    1, std::ptr::null(), std::ptr::null(),
+                )
+            }
+        } else {
+            std::ptr::null()
+        };
+
         // Step 2: Encode main view — standard YUV420 from B-area split
         let main_pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
         let main_pb = Self::create_nv12_from_session_pool(
@@ -1073,10 +1184,12 @@ impl VideoEncoder for VtEncoder {
         )?;
         let (main_nal, main_keyframe) = Self::encode_session_frame(
             self.session, &self.callback_ctx, main_pb, main_pts, duration, self.frame_count,
+            frame_props,
         )?;
         unsafe { CVPixelBufferRelease(main_pb); }
 
         // Step 3: Encode aux view — chroma compensation, same encoder (coherent refs)
+        // Force IDR on aux too if main was forced, to keep both streams in sync
         self.frame_count += 1;
         let aux_pts = CMTime::make(self.frame_count as i64 * frame_duration, 600);
         let aux_pb = Self::create_nv12_from_session_pool(
@@ -1085,8 +1198,13 @@ impl VideoEncoder for VtEncoder {
         )?;
         let (aux_nal, aux_keyframe) = Self::encode_session_frame(
             self.session, &self.callback_ctx, aux_pb, aux_pts, duration, self.frame_count,
+            frame_props,
         )?;
         unsafe { CVPixelBufferRelease(aux_pb); }
+
+        if !frame_props.is_null() {
+            unsafe { CFRelease(frame_props); }
+        }
 
         self.frame_count += 1;
 
@@ -1119,7 +1237,7 @@ impl VideoEncoder for VtEncoder {
     }
 
     fn force_keyframe(&mut self) {
-        // Will be applied on next encode call via frame properties
+        self.pending_force_keyframe = true;
     }
 
     fn supports_444(&self) -> bool {

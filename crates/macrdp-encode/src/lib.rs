@@ -3,6 +3,8 @@
 mod openh264_enc;
 pub mod yuv444_split;
 #[cfg(target_os = "macos")]
+pub mod color_convert;
+#[cfg(target_os = "macos")]
 mod videotoolbox;
 #[cfg(target_os = "macos")]
 
@@ -48,6 +50,12 @@ pub trait VideoEncoder: Send {
     /// Internally performs BGRA -> YUV444 -> B-area split -> dual session encode.
     fn encode_bgra_444(&mut self, data: &[u8], width: u32, height: u32, stride: usize) -> Result<Avc444EncodedFrame>;
 
+    /// Zero-copy encode from CVPixelBuffer (NV12). Default returns error (unsupported).
+    /// Only VtEncoder overrides this.
+    fn encode_pixel_buffer(&mut self, _ptr: *mut std::ffi::c_void, _force_keyframe: bool) -> Result<EncodedFrame> {
+        anyhow::bail!("encode_pixel_buffer not supported by this encoder")
+    }
+
     fn set_bitrate(&mut self, bitrate_bps: u32);
     fn force_keyframe(&mut self);
 
@@ -77,7 +85,7 @@ pub fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u3
 pub enum EncoderPreference {
     /// OpenH264 CPU encoder — full P-frame support, higher latency (~40ms)
     Software,
-    /// VideoToolbox GPU encoder — IDR-only (P-frames incompatible with RDP AVC420), low latency (~6ms)
+    /// VideoToolbox GPU encoder — low latency (~6ms), supports P-frames
     Hardware,
     /// Same as Software (recommended default)
     Auto,

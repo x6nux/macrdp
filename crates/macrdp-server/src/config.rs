@@ -56,6 +56,13 @@ pub struct ServerConfig {
     /// Target bitrate in Mbps (default: auto-calculated from resolution/fps/quality)
     /// Override this to force a specific bitrate, e.g. 50 for 50 Mbps.
     pub bitrate_mbps: Option<u32>,
+    /// Skip encoding when screen content is unchanged (default: true)
+    /// When enabled, idle frames from ScreenCaptureKit are not encoded,
+    /// reducing CPU/GPU usage on static screens.
+    pub skip_unchanged: Option<bool>,
+    /// Seconds between keepalive IDR frames during screen idle (default: 2)
+    /// Prevents RDP client timeout when no frames are being sent.
+    pub idle_keyframe_sec: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +83,8 @@ impl Default for ServerConfig {
             chroma_mode: None,
             hidpi_scale: None,
             bitrate_mbps: None,
+            skip_unchanged: None,
+            idle_keyframe_sec: None,
         }
     }
 }
@@ -169,6 +178,25 @@ mod tests {
         assert_eq!(config.port, 3389);
         assert_eq!(config.frame_rate, 60);
         assert!(config.username.is_none());
+    }
+
+    #[test]
+    fn test_parse_encoding_config() {
+        let toml_str = r#"
+            port = 3389
+            skip_unchanged = false
+            idle_keyframe_sec = 5
+        "#;
+        let config: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.skip_unchanged, Some(false));
+        assert_eq!(config.idle_keyframe_sec, Some(5));
+    }
+
+    #[test]
+    fn test_default_encoding_config() {
+        let config = ServerConfig::default();
+        assert!(config.skip_unchanged.is_none());
+        assert!(config.idle_keyframe_sec.is_none());
     }
 
     #[test]

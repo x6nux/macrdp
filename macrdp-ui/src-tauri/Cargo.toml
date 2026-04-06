@@ -1,0 +1,40 @@
+[workspace]
+
+[patch.crates-io]
+ironrdp-server = { path = "../../crates/ironrdp-server-gfx" }
+ironrdp-acceptor = { path = "../../crates/ironrdp-acceptor-patched" }
+
+[package]
+name = "macrdp-ui"
+version = "0.1.0"
+edition = "2021"
+description = "macrdp GUI — Tauri v2 desktop application"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+macrdp-core = { path = "../../crates/macrdp-core" }
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+toml = "0.8"
+
+[lib]
+name = "macrdp_ui"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[profile.release]
+opt-level = 0
+lto = false
+codegen-units = 16
+strip = false
